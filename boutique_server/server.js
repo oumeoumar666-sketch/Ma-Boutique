@@ -10,6 +10,15 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const MAX_IMAGE_MB = Number(process.env.MAX_IMAGE_MB || 5);
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_KEY || req.headers['x-admin-key'] !== ADMIN_KEY) {
+    return res.status(401).json({ success: false, message: 'Accès administrateur refusé.' });
+  }
+  next();
+}
+
 
 const dataDir = path.join(__dirname, 'data');
 const uploadDir = path.join(__dirname, 'uploads');
@@ -30,9 +39,19 @@ db.prepare(`
     seller_whatsapp TEXT NOT NULL,
     image_url TEXT NOT NULL,
     stock INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    featured_until TEXT,
+    feature_requested INTEGER NOT NULL DEFAULT 0
   )
 `).run();
+
+// Migrations for existing databases
+for (const statement of [
+  `ALTER TABLE products ADD COLUMN featured_until TEXT`,
+  `ALTER TABLE products ADD COLUMN feature_requested INTEGER NOT NULL DEFAULT 0`,
+]) {
+  try { db.prepare(statement).run(); } catch (_) {}
+}
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -65,7 +84,9 @@ app.get('/api/products', (_req, res) => {
     SELECT id, name, description, price, digital,
            download_url AS downloadUrl,
            seller, seller_whatsapp AS sellerWhatsApp,
-           image_url AS imageUrl, stock, created_at AS createdAt
+           image_url AS imageUrl, stock, created_at AS createdAt,
+           featured_until AS featuredUntil,
+           feature_requested AS featureRequested
     FROM products
     ORDER BY datetime(created_at) DESC
   `).all();
@@ -100,13 +121,81 @@ app.post('/api/products', upload.single('image'), (req, res) => {
 
     res.status(201).json({
       success: true,
-      product: { id, name: name.trim(), description: description.trim(), price: numericPrice, digital: isDigital, downloadUrl: downloadUrl.trim(), seller: seller.trim(), sellerWhatsApp: sellerWhatsApp.replace(/\D/g, ''), imageUrl, stock: numericStock, createdAt }
+      product: { id, name: name.trim(), description: description.trim(), price: numericPrice, digital: isDigital, downloadUrl: downloadUrl.trim(), seller: seller.trim(), sellerWhatsApp: sellerWhatsApp.replace(/\D/g, ''), imageUrl, stock: numericStock, createdAt, featuredUntil: null, featureRequested: 0 }
     });
   } catch (error) {
     console.error(error);
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
     res.status(500).json({ success: false, message: 'Erreur serveur lors de la publication.' });
   }
+});
+
+
+
+app.post('/api/products/:id/feature-request', (req, res) => {
+  try {
+    const { seller } = req.body;
+    if (!seller) return res.status(400).json({ success: false, message: 'Vendeur manquant.' });
+    const result = db.prepare(`UPDATE products SET feature_requested = 1 WHERE id = ? AND seller = ?`).run(req.params.id, seller.trim());
+    if (!result.changes) return res.status(404).json({ success: false, message: 'Produit introuvable.' });
+    res.json({ success: true, pending: true, message: 'Demande de mise en avant enregistrée.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Erreur lors de la demande.' });
+  }
+});
+
+app.get('/api/admin/feature-requests', requireAdmin, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT id, name, seller, price, image_url AS imageUrl,
+           feature_requested AS featureRequested,
+           featured_until AS featuredUntil
+    FROM products
+    WHERE feature_requested = 1
+    ORDER BY datetime(created_at) DESC
+  `).all();
+  res.json({ success: true, requests: rows });
+});
+
+app.post('/api/admin/feature-requests/:id/approve', requireAdmin, (req, res) => {
+  try {
+    const days = Number.parseInt(req.body.days, 10);
+    if (![3, 7, 30].includes(days)) {
+      return res.status(400).json({ success: false, message: 'Durée invalide.' });
+    }
+    const until = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+    const result = db.prepare(`
+      UPDATE products
+      SET feature_requested = 0, featured_until = ?
+      WHERE id = ?
+    `).run(until, req.params.id);
+    if (!result.changes) return res.status(404).json({ success: false, message: 'Produit introuvable.' });
+    res.json({ success: true, featuredUntil: until });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Validation impossible.' });
+  }
+});
+
+app.post('/api/admin/feature-requests/:id/reject', requireAdmin, (req, res) => {
+  const result = db.prepare(`UPDATE products SET feature_requested = 0 WHERE id = ?`).run(req.params.id);
+  if (!result.changes) return res.status(404).json({ success: false, message: 'Produit introuvable.' });
+  res.json({ success: true });
+});
+
+app.get('/api/featured-products', (_req, res) => {
+  const rows = db.prepare(`
+    SELECT id, name, description, price, digital,
+           download_url AS downloadUrl, seller,
+           seller_whatsapp AS sellerWhatsApp,
+           image_url AS imageUrl, stock,
+           created_at AS createdAt,
+           featured_until AS featuredUntil
+    FROM products
+    WHERE featured_until IS NOT NULL AND datetime(featured_until) > datetime('now')
+    ORDER BY datetime(featured_until) DESC
+  `).all();
+  res.json({ success: true, products: rows });
 });
 
 app.use((err, _req, res, _next) => {
