@@ -1,6 +1,6 @@
 {
   "name": "ma-boutique-marketplace-server",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "private": true,
   "description": "Serveur central pour la marketplace Ma Boutique",
   "main": "server.js",
