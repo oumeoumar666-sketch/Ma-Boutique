@@ -12,7 +12,11 @@ const MAX_IMAGE_MB = Number(process.env.MAX_IMAGE_MB || 5);
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 // Supabase - les deux variables sont à configurer dans Render.
-const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_URL = (process.env.SUPABASE_URL || '')
+  .trim()
+  .replace(/\/+$/, '')
+  .replace(/\/rest\/v1$/, '')
+  .replace(/\/storage\/v1$/, '');
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || '';
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'product-images';
 
