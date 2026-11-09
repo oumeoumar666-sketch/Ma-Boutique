@@ -45,6 +45,19 @@ const SUPABASE_URL = (process.env.SUPABASE_URL || '')
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '';
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'product-images';
+const DJOMY_CLIENT_ID = (process.env.DJOMY_CLIENT_ID || '').trim();
+const DJOMY_CLIENT_SECRET = (process.env.DJOMY_CLIENT_SECRET || '').trim();
+const DJOMY_WEBHOOK_SECRET = (process.env.DJOMY_WEBHOOK_SECRET || DJOMY_CLIENT_SECRET).trim();
+const DJOMY_API_BASE_URL = (process.env.DJOMY_API_BASE_URL || 'https://sandbox-api.djomy.africa')
+  .trim().replace(/\/+$/, '');
+const DJOMY_SUBSCRIPTION_AMOUNT_GNF = 20000;
+let djomyCachedToken = '';
+let djomyTokenExpiresAt = 0;
+const GNAKRYPAY_API_KEY = (process.env.GNAKRYPAY_API_KEY || '').trim();
+const GNAKRYPAY_WEBHOOK_SECRET = (process.env.GNAKRYPAY_WEBHOOK_SECRET || '').trim();
+const GNAKRYPAY_API_BASE_URL = (process.env.GNAKRYPAY_API_BASE_URL || 'https://api.gnakrypay.com/v1')
+  .trim().replace(/\/+$/, '');
+const GNAKRYPAY_SUBSCRIPTION_AMOUNT_GNF = 20000;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.warn('ATTENTION: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY est manquant.');
@@ -217,6 +230,99 @@ async function supabaseRequest(endpoint, options = {}) {
   return data;
 }
 
+function djomyApiKey() {
+  if (!DJOMY_CLIENT_ID || !DJOMY_CLIENT_SECRET) {
+    const error = new Error('Djomy n’est pas encore configuré sur le serveur.');
+    error.status = 503;
+    throw error;
+  }
+  const signature = crypto.createHmac('sha256', DJOMY_CLIENT_SECRET)
+    .update(DJOMY_CLIENT_ID).digest('hex');
+  return `${DJOMY_CLIENT_ID}:${signature}`;
+}
+
+async function djomyRequest(pathname, { method = 'GET', body, bearer = true } = {}) {
+  const apiKey = djomyApiKey();
+  const headers = { 'X-API-KEY': apiKey, ...(body ? { 'Content-Type': 'application/json' } : {}) };
+  if (bearer) {
+    if (!djomyCachedToken || Date.now() >= djomyTokenExpiresAt - 60000) {
+      const authResponse = await fetch(`${DJOMY_API_BASE_URL}/v1/auth`, {
+        method: 'POST',
+        headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+      });
+      const authData = await authResponse.json().catch(() => null);
+      const accessToken = authData?.access_token || authData?.data?.access_token || authData?.data?.accessToken;
+      if (!authResponse.ok || !accessToken) {
+        const providerMessage = authData?.error?.message || authData?.message || authData?.data?.message;
+        const error = new Error(
+          `Authentification Djomy impossible (HTTP ${authResponse.status})${providerMessage ? ` : ${providerMessage}` : '.'}`
+        );
+        error.status = 502;
+        throw error;
+      }
+      djomyCachedToken = accessToken;
+      djomyTokenExpiresAt = Date.now() + Math.max(60, Number(authData?.data?.expiresIn || authData?.expires_in || 3600)) * 1000;
+    }
+    headers.Authorization = `Bearer ${djomyCachedToken}`;
+  }
+  const response = await fetch(`${DJOMY_API_BASE_URL}${pathname}`, {
+    method,
+    headers,
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+  if (!response.ok) {
+    const error = new Error(data?.message || data?.error || 'La demande Djomy a échoué.');
+    error.status = response.status >= 400 && response.status < 500 ? 502 : response.status;
+    throw error;
+  }
+  return data || {};
+}
+
+async function verifyDjomyPayment(transactionId) {
+  const result = await djomyRequest(
+    `/v1/payments/${encodeURIComponent(transactionId)}/status`,
+  );
+  return result?.data?.payment || result?.payment || result?.data || result;
+}
+
+async function activateDjomySubscription(payment) {
+  const reference = payment?.merchantPaymentReference;
+  const transactionId = payment?.transactionId;
+  const amount = Number(payment?.paidAmount ?? payment?.amount);
+  const currency = String(payment?.currency || payment?.currencyCode || '').toUpperCase();
+  if (!reference || !transactionId || amount !== DJOMY_SUBSCRIPTION_AMOUNT_GNF || currency !== 'GNF') {
+    return { matched: false };
+  }
+
+  const rows = await supabaseRequest(
+    `/rest/v1/djomy_subscription_payments?merchant_reference=eq.${encodeURIComponent(reference)}&transaction_id=eq.${encodeURIComponent(transactionId)}&select=merchant_reference,user_id,amount_gnf,status`
+  );
+  const record = rows[0];
+  if (!record || Number(record.amount_gnf) !== DJOMY_SUBSCRIPTION_AMOUNT_GNF) {
+    return { matched: false };
+  }
+
+  const now = new Date();
+  const expiration = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const codeHash = crypto.createHash('sha256')
+    .update(`djomy:${reference}:${transactionId}`).digest('hex');
+  const result = await supabaseRequest('/rest/v1/rpc/confirm_djomy_subscription_payment', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      p_merchant_reference: reference,
+      p_transaction_id: transactionId,
+      p_code_hash: codeHash,
+      p_now: now.toISOString(),
+      p_expires_at: expiration.toISOString(),
+    }),
+  });
+  return { matched: true, activated: result === true || result?.activated === true };
+}
+
 function supabasePublicImageUrl(fileName) {
   return `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/${encodeURIComponent(fileName)}`;
 }
@@ -279,7 +385,10 @@ function imageFileNameFromUrl(imageUrl) {
 }
 
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({
+  limit: '1mb',
+  verify(req, _res, buffer) { req.rawBody = Buffer.from(buffer); },
+}));
 
 try {
   const helmet = require('helmet');
@@ -354,13 +463,163 @@ app.post('/api/webhooks/lengo', async (req, res) => {
   }
 });
 
+// Djomy: abonnement vendeur uniquement. Le statut de retour client n'est jamais
+// utilisé pour activer un abonnement; seule une vérification serveur le permet.
+app.post('/api/payments/djomy/subscription/initiate', requireFirebaseUser, requireSellerRole, async (req, res) => {
+  let merchantReference;
+  try {
+    const rawPhone = typeof req.body?.phone === 'string' ? req.body.phone.trim() : '';
+    const paymentMethod = req.body?.paymentMethod;
+    let phone = rawPhone.replace(/[\s().-]/g, '').replace(/^\+/, '00');
+    if (/^\d{9}$/.test(phone)) phone = `00224${phone}`;
+    if (!/^00224\d{9}$/.test(phone) || !['OM', 'MOMO'].includes(paymentMethod)) {
+      return res.status(400).json({ success: false, message: 'Vérifie le numéro guinéen et le moyen de paiement.' });
+    }
+    if (!PUBLIC_BASE_URL.startsWith('https://')) {
+      return res.status(503).json({ success: false, message: 'Le serveur doit avoir une URL HTTPS publique pour le retour Djomy.' });
+    }
+
+    merchantReference = `MB-SUB-${crypto.randomUUID()}`;
+    await supabaseRequest('/rest/v1/djomy_subscription_payments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        merchant_reference: merchantReference,
+        user_id: req.firebaseUser.uid,
+        amount_gnf: DJOMY_SUBSCRIPTION_AMOUNT_GNF,
+        payment_method: paymentMethod,
+        status: 'creating',
+      }),
+    });
+
+    const returnUrl = `${PUBLIC_BASE_URL}/api/payments/djomy/return?reference=${encodeURIComponent(merchantReference)}`;
+    const result = await djomyRequest('/v1/payments/gateway', {
+      method: 'POST',
+      body: {
+        amount: DJOMY_SUBSCRIPTION_AMOUNT_GNF,
+        countryCode: 'GN',
+        payerNumber: phone,
+        allowedPaymentMethods: [paymentMethod],
+        description: 'Abonnement vendeur Ma Boutique - 30 jours',
+        merchantPaymentReference: merchantReference,
+        returnUrl,
+        cancelUrl: returnUrl,
+        metadata: { user_id: req.firebaseUser.uid, purpose: 'seller_subscription' },
+      },
+    });
+    const payment = result?.data?.payment || result?.payment || result?.data || result;
+    const transactionId = payment?.transactionId || payment?.id;
+    const paymentUrl = payment?.paymentUrl || payment?.redirectUrl || payment?.gatewayUrl || payment?.url;
+    if (!transactionId || !paymentUrl) {
+      throw new Error('Djomy n’a pas renvoyé le lien ou la référence de paiement attendue.');
+    }
+    await supabaseRequest(
+      `/rest/v1/djomy_subscription_payments?merchant_reference=eq.${encodeURIComponent(merchantReference)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify({ transaction_id: transactionId, status: 'pending' }),
+      }
+    );
+    res.status(201).json({ success: true, merchantReference, transactionId, paymentUrl });
+  } catch (error) {
+    if (merchantReference) {
+      try {
+        await supabaseRequest(
+          `/rest/v1/djomy_subscription_payments?merchant_reference=eq.${encodeURIComponent(merchantReference)}`,
+          { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'failed' }) }
+        );
+      } catch (_) {}
+    }
+    console.error('POST /api/payments/djomy/subscription/initiate:', error.message);
+    res.status(error.status || 502).json({ success: false, message: error.message || 'Impossible de démarrer le paiement Djomy.' });
+  }
+});
+
+app.get('/api/payments/djomy/subscription/:merchantReference/status', requireFirebaseUser, requireSellerRole, async (req, res) => {
+  try {
+    const reference = req.params.merchantReference;
+    const rows = await supabaseRequest(
+      `/rest/v1/djomy_subscription_payments?merchant_reference=eq.${encodeURIComponent(reference)}&user_id=eq.${encodeURIComponent(req.firebaseUser.uid)}&select=merchant_reference,transaction_id,status,amount_gnf`
+    );
+    const record = rows[0];
+    if (!record) return res.status(404).json({ success: false, message: 'Paiement introuvable.' });
+    if (record.status === 'success') return res.json({ success: true, status: 'SUCCESS', isPaid: true });
+    if (!record.transaction_id) return res.json({ success: true, status: record.status, isPaid: false });
+
+    const verified = await verifyDjomyPayment(record.transaction_id);
+    const status = String(verified?.status || '').toUpperCase();
+    let activated = false;
+    if (status === 'SUCCESS') {
+      const activation = await activateDjomySubscription(verified);
+      activated = activation.activated;
+      if (!activation.matched) {
+        return res.status(409).json({ success: false, message: 'Les informations vérifiées ne correspondent pas au paiement attendu.' });
+      }
+      if (!activated) {
+        const latest = await supabaseRequest(
+          `/rest/v1/djomy_subscription_payments?merchant_reference=eq.${encodeURIComponent(reference)}&user_id=eq.${encodeURIComponent(req.firebaseUser.uid)}&select=status`
+        );
+        if (latest[0]?.status !== 'success') {
+          return res.status(409).json({ success: false, message: 'Le paiement est confirmé, mais l’activation doit être réessayée.' });
+        }
+      }
+    } else if (['FAILED', 'CANCELLED', 'TIMEOUT'].includes(status)) {
+      await supabaseRequest(
+        `/rest/v1/djomy_subscription_payments?merchant_reference=eq.${encodeURIComponent(reference)}&status=eq.pending`,
+        { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'failed' }) }
+      );
+    }
+    res.json({ success: true, status, isPaid: status === 'SUCCESS', activated });
+  } catch (error) {
+    console.error('GET Djomy subscription status:', error.message);
+    res.status(error.status || 502).json({ success: false, message: error.message || 'Impossible de vérifier le paiement Djomy.' });
+  }
+});
+
+app.post('/api/webhooks/djomy', async (req, res) => {
+  try {
+    if (!DJOMY_WEBHOOK_SECRET || !req.rawBody) {
+      return res.status(503).json({ success: false, message: 'Vérification du webhook Djomy non configurée.' });
+    }
+    const supplied = String(req.headers['x-webhook-signature'] || '');
+    const signature = supplied.replace(/^v1:/i, '').trim();
+    const expected = crypto.createHmac('sha256', DJOMY_WEBHOOK_SECRET).update(req.rawBody).digest('hex');
+    const valid = /^[a-f0-9]{64}$/i.test(signature) && crypto.timingSafeEqual(
+      Buffer.from(signature.toLowerCase(), 'hex'), Buffer.from(expected, 'hex')
+    );
+    if (!valid) return res.status(401).json({ success: false, message: 'Signature Djomy invalide.' });
+
+    const eventType = String(req.body?.eventType || '');
+    if (eventType !== 'payment.success') return res.json({ success: true, ignored: true });
+    const payment = req.body?.data?.payment || req.body?.data || {};
+    const transactionId = payment.transactionId;
+    if (!transactionId) return res.status(400).json({ success: false, message: 'Référence transaction absente.' });
+
+    const verified = await verifyDjomyPayment(transactionId);
+    if (String(verified?.status || '').toUpperCase() !== 'SUCCESS') {
+      return res.json({ success: true, ignored: true, message: 'Le paiement n’est pas confirmé par Djomy.' });
+    }
+    const activation = await activateDjomySubscription(verified);
+    if (!activation.matched) return res.status(400).json({ success: false, message: 'Paiement sans abonnement correspondant.' });
+    return res.json({ success: true, activated: activation.activated });
+  } catch (error) {
+    console.error('Webhook Djomy:', error.message);
+    res.status(error.status || 500).json({ success: false, message: 'Traitement du webhook Djomy impossible.' });
+  }
+});
+
+app.get('/api/payments/djomy/return', (_req, res) => {
+  res.type('html').send('<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Ma Boutique</title><body style="font:16px sans-serif;padding:32px">Retour de paiement reçu. Ma Boutique vérifie la transaction auprès de Djomy. Tu peux revenir dans l’application pour consulter son statut.</body></html>');
+});
+
 async function notifyBuyersAboutNewProduct(product) {
   if (!firebaseMessaging) return;
   try {
     await firebaseMessaging.send({
-      topic: 'ma_boutique_new_products',
+      topic: 'dunya_store_new_products',
       notification: {
-        title: 'Nouveau produit sur Ma Boutique',
+        title: 'Nouveau produit sur Dunya Store',
         body: `${product.name} est disponible chez ${product.seller}.`,
       },
       android: {
@@ -386,7 +645,7 @@ async function notifySellerAboutNewOrder(order) {
   if (!firebaseMessaging) return;
   try {
     await firebaseMessaging.send({
-      topic: 'ma_boutique_seller_orders',
+      topic: 'dunya_store_seller_orders',
       notification: {
         title: 'Nouvelle demande de commande',
         body: 'Un acheteur attend la confirmation de sa demande.',
@@ -413,9 +672,9 @@ async function notifyUserAboutNewChatMessage(senderName, messageText, productId)
   if (!firebaseMessaging) return;
   try {
     await firebaseMessaging.send({
-      topic: 'ma_boutique_new_products',
+      topic: 'dunya_store_new_products',
       notification: {
-        title: `Nouveau message de ${senderName || 'Ma Boutique'}`,
+        title: `Nouveau message de ${senderName || 'Dunya Store'}`,
         body: messageText ? messageText.slice(0, 100) : 'Vous avez reçu une image.',
       },
       android: {
@@ -1098,15 +1357,23 @@ app.get('/api/marketplace/orders', requireFirebaseUser, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Accès réservé aux acheteurs et vendeurs.' });
     }
     const key = role === 'buyer' ? 'buyer_uid' : 'seller_uid';
-    const rows = await supabaseRequest(
-      `/rest/v1/marketplace_orders?select=id,buyer_uid,seller_uid,product_id,product_name,unit_price_gnf,unit_price_currency,quantity,buyer_name,buyer_phone,delivery_area,buyer_note,delivery_person_name,delivery_person_phone,status,created_at&${key}=eq.${encodeURIComponent(req.firebaseUser.uid)}&order=created_at.desc`
-    );
+    let rows = [];
+    try {
+      rows = await supabaseRequest(
+        `/rest/v1/marketplace_orders?select=id,buyer_uid,seller_uid,product_id,product_name,product_image,unit_price_gnf,unit_price_currency,quantity,buyer_name,buyer_phone,delivery_area,buyer_note,delivery_person_name,delivery_person_phone,status,created_at&${key}=eq.${encodeURIComponent(req.firebaseUser.uid)}&order=created_at.desc`
+      );
+    } catch (_) {
+      rows = await supabaseRequest(
+        `/rest/v1/marketplace_orders?select=id,buyer_uid,seller_uid,product_id,product_name,unit_price_gnf,unit_price_currency,quantity,buyer_name,buyer_phone,delivery_area,buyer_note,delivery_person_name,delivery_person_phone,status,created_at&${key}=eq.${encodeURIComponent(req.firebaseUser.uid)}&order=created_at.desc`
+      );
+    }
     return res.json({ success: true, orders: rows.map((row) => ({
       id: row.id,
       buyerUid: row.buyer_uid,
       sellerUid: row.seller_uid,
       productId: row.product_id,
       productName: row.product_name,
+      productImage: row.product_image || '',
       amount: Number(row.unit_price_gnf) * Number(row.quantity),
       unitPrice: Number(row.unit_price_gnf),
       currency: row.unit_price_currency || 'GNF',
@@ -1137,29 +1404,51 @@ app.post('/api/marketplace/orders', requireFirebaseUser, requireMarketplaceRole,
   }
   try {
     const products = await supabaseRequest(
-      `/rest/v1/products?id=eq.${encodeURIComponent(productId)}&select=id,name,price,price_currency,stock,digital,owner_uid&limit=1`
+      `/rest/v1/products?id=eq.${encodeURIComponent(productId)}&select=id,name,price,price_currency,stock,digital,owner_uid,image_url&limit=1`
     );
     const product = products[0];
     if (!product || !product.owner_uid || (!product.digital && Number(product.stock || 0) < quantity)) {
       return res.status(409).json({ success: false, message: 'Ce produit ou cette quantité n’est plus disponible.' });
     }
-    const rows = await supabaseRequest('/rest/v1/marketplace_orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
-      body: JSON.stringify({
-        buyer_uid: req.firebaseUser.uid,
-        seller_uid: product.owner_uid,
-        product_id: product.id,
-        product_name: product.name,
-        unit_price_gnf: Number(product.price),
-        unit_price_currency: product.price_currency || 'GNF',
-        quantity,
-        buyer_name: buyerName,
-        buyer_phone: buyerPhone,
-        delivery_area: deliveryArea,
-        buyer_note: note,
-      }),
-    });
+    let rows = [];
+    try {
+      rows = await supabaseRequest('/rest/v1/marketplace_orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+        body: JSON.stringify({
+          buyer_uid: req.firebaseUser.uid,
+          seller_uid: product.owner_uid,
+          product_id: product.id,
+          product_name: product.name,
+          product_image: product.image_url || '',
+          unit_price_gnf: Number(product.price),
+          unit_price_currency: product.price_currency || 'GNF',
+          quantity,
+          buyer_name: buyerName,
+          buyer_phone: buyerPhone,
+          delivery_area: deliveryArea,
+          buyer_note: note,
+        }),
+      });
+    } catch (_) {
+      rows = await supabaseRequest('/rest/v1/marketplace_orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+        body: JSON.stringify({
+          buyer_uid: req.firebaseUser.uid,
+          seller_uid: product.owner_uid,
+          product_id: product.id,
+          product_name: product.name,
+          unit_price_gnf: Number(product.price),
+          unit_price_currency: product.price_currency || 'GNF',
+          quantity,
+          buyer_name: buyerName,
+          buyer_phone: buyerPhone,
+          delivery_area: deliveryArea,
+          buyer_note: note,
+        }),
+      });
+    }
     const order = rows[0];
     if (!order) throw new Error('La demande de commande n’a pas été enregistrée.');
     void notifySellerAboutNewOrder(order);
@@ -1169,6 +1458,7 @@ app.post('/api/marketplace/orders', requireFirebaseUser, requireMarketplaceRole,
         id: order.id,
         productId: order.product_id,
         productName: order.product_name,
+        productImage: order.product_image || product.image_url || '',
         amount: Number(order.unit_price_gnf) * Number(order.quantity),
         currency: order.unit_price_currency || 'GNF',
         quantity: Number(order.quantity),
@@ -1279,6 +1569,18 @@ app.patch('/api/marketplace/orders/:id', requireFirebaseUser, requireSellerRole,
 
     if (!updated.length) return res.status(409).json({ success: false, message: 'Cette demande n’a pas pu être mise à jour.' });
 
+    if (status !== 'in_delivery') {
+      try {
+        await supabaseRequest(`/rest/v1/delivery_tracking?order_id=eq.${orderId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+          body: JSON.stringify({ active: false, latitude: null, longitude: null, accuracy_m: null, recorded_at: null }),
+        });
+      } catch (_) {
+        // La migration peut ne pas encore être appliquée sur une ancienne base.
+      }
+    }
+
     void notifyBuyerAboutOrderStatus(updated[0]);
 
     return res.json({
@@ -1289,6 +1591,132 @@ app.patch('/api/marketplace/orders/:id', requireFirebaseUser, requireSellerRole,
     });
   } catch (error) {
     return res.status(error.status || 500).json({ success: false, message: error.message || 'Impossible de mettre à jour la commande.' });
+  }
+});
+
+// Le code est un secret à usage limité : seul son hash est stocké en base.
+app.post('/api/marketplace/orders/:id/tracking-invite', requireFirebaseUser, requireSellerRole, async (req, res) => {
+  try {
+    const orderId = encodeURIComponent(req.params.id);
+    const sellerUid = encodeURIComponent(req.firebaseUser.uid);
+    const orders = await supabaseRequest(
+      `/rest/v1/marketplace_orders?id=eq.${orderId}&seller_uid=eq.${sellerUid}&select=id,status,delivery_person_phone&limit=1`
+    );
+    const order = orders[0];
+    if (!order) return res.status(404).json({ success: false, message: 'Commande introuvable.' });
+    if (order.status !== 'in_delivery') return res.status(409).json({ success: false, message: 'Passe d’abord la commande en livraison.' });
+    const phone = String(order.delivery_person_phone || '').replace(/[^0-9+]/g, '');
+    if (phone.length < 8) return res.status(400).json({ success: false, message: 'Ajoute le numéro du livreur avant de créer le code.' });
+
+    const token = crypto.randomBytes(24).toString('base64url');
+    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+    await supabaseRequest('/rest/v1/delivery_tracking?on_conflict=order_id', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({
+        order_id: order.id,
+        invite_token_hash: crypto.createHash('sha256').update(token).digest('hex'),
+        courier_phone: phone,
+        latitude: null,
+        longitude: null,
+        accuracy_m: null,
+        recorded_at: null,
+        active: false,
+        expires_at: expiresAt,
+      }),
+    });
+    return res.json({ success: true, code: token, expiresAt });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message || 'Impossible de créer le code de suivi.' });
+  }
+});
+
+app.get('/api/marketplace/orders/:id/tracking', requireFirebaseUser, async (req, res) => {
+  try {
+    const profiles = await supabaseRequest(
+      `/rest/v1/user_profiles?user_id=eq.${encodeURIComponent(req.firebaseUser.uid)}&select=role&limit=1`
+    );
+    const role = profiles[0]?.role;
+    if (!['buyer', 'seller'].includes(role)) return res.status(403).json({ success: false, message: 'Accès refusé.' });
+    const ownerColumn = role === 'buyer' ? 'buyer_uid' : 'seller_uid';
+    const orders = await supabaseRequest(
+      `/rest/v1/marketplace_orders?id=eq.${encodeURIComponent(req.params.id)}&${ownerColumn}=eq.${encodeURIComponent(req.firebaseUser.uid)}&select=id&limit=1`
+    );
+    if (!orders.length) return res.status(404).json({ success: false, message: 'Commande introuvable.' });
+    const rows = await supabaseRequest(
+      `/rest/v1/delivery_tracking?order_id=eq.${encodeURIComponent(req.params.id)}&select=latitude,longitude,accuracy_m,recorded_at,active,expires_at&limit=1`
+    );
+    const tracking = rows[0];
+    const isActive = Boolean(tracking?.active && Date.parse(tracking.expires_at) > Date.now());
+    if (tracking && Date.parse(tracking.expires_at) <= Date.now()) {
+      await supabaseRequest(`/rest/v1/delivery_tracking?order_id=eq.${encodeURIComponent(req.params.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify({ active: false, latitude: null, longitude: null, accuracy_m: null, recorded_at: null }),
+      });
+    }
+    return res.json({
+      success: true,
+      tracking: tracking ? {
+        latitude: isActive ? tracking.latitude : null,
+        longitude: isActive ? tracking.longitude : null,
+        accuracy: isActive ? tracking.accuracy_m : null,
+        recordedAt: isActive ? tracking.recorded_at : null,
+        active: isActive,
+      } : { active: false },
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message || 'Impossible de récupérer la position.' });
+  }
+});
+
+app.post('/api/delivery-tracking/location', async (req, res) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  const latitude = Number(req.body?.latitude);
+  const longitude = Number(req.body?.longitude);
+  const accuracy = Number(req.body?.accuracy);
+  if (code.length < 32 || code.length > 100 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180 || !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 10000) {
+    return res.status(400).json({ success: false, message: 'Code ou coordonnées GPS invalides.' });
+  }
+  try {
+    const hash = crypto.createHash('sha256').update(code).digest('hex');
+    const sessions = await supabaseRequest(
+      `/rest/v1/delivery_tracking?invite_token_hash=eq.${hash}&select=order_id,courier_phone,expires_at&limit=1`
+    );
+    const session = sessions[0];
+    if (!session || Date.parse(session.expires_at) <= Date.now()) return res.status(401).json({ success: false, message: 'Code invalide ou expiré.' });
+    const orders = await supabaseRequest(
+      `/rest/v1/marketplace_orders?id=eq.${encodeURIComponent(session.order_id)}&select=status&limit=1`
+    );
+    if (orders[0]?.status !== 'in_delivery') return res.status(409).json({ success: false, message: 'Cette livraison n’est plus active.' });
+    await supabaseRequest(`/rest/v1/delivery_tracking?order_id=eq.${encodeURIComponent(session.order_id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({ latitude, longitude, accuracy_m: accuracy, recorded_at: new Date().toISOString(), active: true }),
+    });
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message || 'Impossible d’enregistrer la position.' });
+  }
+});
+
+app.post('/api/delivery-tracking/stop', async (req, res) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  if (code.length < 32 || code.length > 100) return res.status(400).json({ success: false, message: 'Code invalide.' });
+  try {
+    const hash = crypto.createHash('sha256').update(code).digest('hex');
+    const sessions = await supabaseRequest(
+      `/rest/v1/delivery_tracking?invite_token_hash=eq.${hash}&select=order_id&limit=1`
+    );
+    if (!sessions.length) return res.status(404).json({ success: false, message: 'Code introuvable.' });
+    await supabaseRequest(`/rest/v1/delivery_tracking?order_id=eq.${encodeURIComponent(sessions[0].order_id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({ active: false, latitude: null, longitude: null, accuracy_m: null, recorded_at: null }),
+    });
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message || 'Impossible d’arrêter le suivi.' });
   }
 });
 
@@ -1478,7 +1906,7 @@ app.get('/api/sales', requireFirebaseUser, requireSellerRole, async (req, res) =
   try {
     const ownerUid = encodeURIComponent(req.firebaseUser.uid);
     const rows = await supabaseRequest(
-      `/rest/v1/marketplace_sales?select=id,product_id,product_name,amount_gnf,quantity,currency,commercial_uid,commission_percent,commission_gnf,created_at&owner_uid=eq.${ownerUid}&order=created_at.desc`
+      `/rest/v1/marketplace_sales?select=id,product_id,product_name,amount_gnf,quantity,currency,commercial_uid,commission_percent,commission_gnf,platform_commission_percent,platform_commission_amount,seller_net_amount,created_at&owner_uid=eq.${ownerUid}&order=created_at.desc`
     );
     res.json({
       success: true,
@@ -1492,6 +1920,9 @@ app.get('/api/sales', requireFirebaseUser, requireSellerRole, async (req, res) =
         commercialUid: row.commercial_uid,
         commissionPercent: Number(row.commission_percent || 0),
         commissionAmount: Number(row.commission_gnf || 0),
+        platformCommissionPercent: Number(row.platform_commission_percent || 0),
+        platformCommissionAmount: Number(row.platform_commission_amount || 0),
+        sellerNetAmount: Number(row.seller_net_amount ?? row.amount_gnf),
         date: row.created_at,
       })),
     });
@@ -1532,6 +1963,9 @@ app.post('/api/products/:id/sale', requireFirebaseUser, requireSellerRole, async
         commercialUid: row.commercial_uid,
         commissionPercent: Number(row.commission_percent || 0),
         commissionAmount: Number(row.commission_gnf || 0),
+        platformCommissionPercent: Number(row.platform_commission_percent || 0),
+        platformCommissionAmount: Number(row.platform_commission_amount || 0),
+        sellerNetAmount: Number(row.seller_net_amount ?? row.amount_gnf),
         date: row.created_at,
       },
     });
@@ -1872,137 +2306,260 @@ app.get('/api/featured-products', async (_req, res) => {
   }
 });
 
-// MTN MoMo Payment Service Integration
-const MTN_MOMO_SUBSCRIPTION_KEY = (process.env.MTN_MOMO_SUBSCRIPTION_KEY || '').trim();
-const MTN_MOMO_API_USER = (process.env.MTN_MOMO_API_USER || '').trim();
-const MTN_MOMO_API_KEY = (process.env.MTN_MOMO_API_KEY || '').trim();
-const MTN_MOMO_ENVIRONMENT = (process.env.MTN_MOMO_ENVIRONMENT || 'sandbox').trim().toLowerCase();
-const MTN_MOMO_TARGET_ENVIRONMENT = (process.env.MTN_MOMO_TARGET_ENVIRONMENT || 'mtnguinea').trim();
-
-const mtnBaseUrl = MTN_MOMO_ENVIRONMENT === 'production'
-  ? 'https://ericssonbasicapi2.azure-api.net'
-  : 'https://sandbox.momodeveloper.mtn.com';
-
-async function getMtnMomoToken() {
-  if (!MTN_MOMO_SUBSCRIPTION_KEY || !MTN_MOMO_API_USER || !MTN_MOMO_API_KEY) {
-    const err = new Error('Clés API MTN MoMo non configurées sur le serveur.');
-    err.status = 503;
-    throw err;
+// GnakryPay subscription payments. Credentials stay in the server environment.
+async function gnakryPayRequest(pathname, { method = 'GET', body, idempotencyKey } = {}) {
+  if (!GNAKRYPAY_API_KEY) {
+    const error = new Error('Clé API GnakryPay non configurée sur le serveur.');
+    error.status = 503;
+    throw error;
   }
-
-  const credentials = Buffer.from(`${MTN_MOMO_API_USER}:${MTN_MOMO_API_KEY}`).toString('base64');
-  const response = await fetch(`${mtnBaseUrl}/collection/token/`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      'Ocp-Apim-Subscription-Key': MTN_MOMO_SUBSCRIPTION_KEY,
-    },
+  const headers = { Authorization: `Bearer ${GNAKRYPAY_API_KEY}` };
+  if (body) headers['Content-Type'] = 'application/json';
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+  const response = await fetch(`${GNAKRYPAY_API_BASE_URL}${pathname}`, {
+    method,
+    headers,
+    ...(body ? { body: JSON.stringify(body) } : {}),
   });
-
-  const data = await response.json().catch(() => null);
-  if (!response.ok || !data?.access_token) {
-    throw new Error(data?.message || 'Échec de l’authentification OAuth2 MTN MoMo.');
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+  if (!response.ok) {
+    const error = new Error(data?.message || `GnakryPay a refusé la demande (HTTP ${response.status}).`);
+    error.status = response.status >= 400 && response.status < 500 ? 502 : response.status;
+    error.code = data?.code;
+    throw error;
   }
-  return data.access_token;
+  return data || {};
 }
 
-app.post('/api/payments/mtn-momo/initiate', requireFirebaseUser, async (req, res) => {
-  try {
-    const amount = Number(req.body?.amount || 20000);
-    const partyId = typeof req.body?.phone === 'string' ? req.body.phone.replace(/[^0-9]/g, '').trim() : '';
-    const externalId = `MB-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+function gnakryPaymentPayload(data) {
+  return data?.payment || data?.data?.payment || data?.data || data || {};
+}
 
-    if (!partyId || partyId.length < 8 || amount <= 0) {
-      return res.status(400).json({ success: false, message: 'Numéro de téléphone ou montant invalide pour MTN MoMo.' });
+function normalizeGuineaPaymentPhone(value) {
+  let digits = typeof value === 'string' ? value.replace(/\D/g, '') : '';
+  if (digits.startsWith('00224')) digits = digits.slice(5);
+  else if (digits.startsWith('224') && digits.length === 12) digits = digits.slice(3);
+  return /^\d{9}$/.test(digits) ? digits : '';
+}
+
+async function activateGnakrySubscription(payment) {
+  const reference = String(payment?.reference || '');
+  const paymentId = String(payment?.payment_id || payment?.id || '');
+  const amount = String(payment?.amount ?? '');
+  const currency = String(payment?.currency || '').toUpperCase();
+  const status = String(payment?.payment_status || payment?.status || '').toUpperCase();
+  if (!reference || !paymentId || amount !== String(GNAKRYPAY_SUBSCRIPTION_AMOUNT_GNF) || currency !== 'GNF' || status !== 'SUCCESS') {
+    return { matched: false, activated: false };
+  }
+
+  const rows = await supabaseRequest(
+    `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&select=reference,payment_id,user_id,amount_gnf,status`
+  );
+  const record = rows[0];
+  if (!record || Number(record.amount_gnf) !== GNAKRYPAY_SUBSCRIPTION_AMOUNT_GNF ||
+      (record.payment_id && record.payment_id !== paymentId)) {
+    return { matched: false, activated: false };
+  }
+  if (record.status === 'success') return { matched: true, activated: true };
+
+  await supabaseRequest(
+    `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&status=eq.creating`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({ payment_id: paymentId, status: 'pending' }),
+    }
+  );
+  const now = new Date();
+  const expiration = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const codeHash = crypto.createHash('sha256').update(`gnakrypay:${reference}:${paymentId}`).digest('hex');
+  const result = await supabaseRequest('/rest/v1/rpc/confirm_gnakrypay_subscription_payment', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      p_reference: reference,
+      p_payment_id: paymentId,
+      p_code_hash: codeHash,
+      p_now: now.toISOString(),
+      p_expires_at: expiration.toISOString(),
+    }),
+  });
+  let activated = result === true || result?.confirm_gnakrypay_subscription_payment === true;
+  if (!activated) {
+    const latest = await supabaseRequest(
+      `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&select=status`
+    );
+    activated = latest[0]?.status === 'success';
+  }
+  return { matched: true, activated };
+}
+
+app.post('/api/payments/gnakrypay/subscription/initiate', requireFirebaseUser, requireSellerRole, async (req, res) => {
+  let reference;
+  let providerPaymentCreated = false;
+  try {
+    const phone = normalizeGuineaPaymentPhone(req.body?.phone);
+    const operator = String(req.body?.operator || '').toUpperCase();
+    if (!phone || !['MTN_GN', 'ORANGE_GN'].includes(operator)) {
+      return res.status(400).json({ success: false, message: 'Entre un numéro guinéen valide et choisis MTN ou Orange Money.' });
     }
 
-    const token = await getMtnMomoToken();
-    const referenceId = crypto.randomUUID();
-
-    const response = await fetch(`${mtnBaseUrl}/collection/v1_0/requesttopay`, {
+    reference = `MB-SUB-${crypto.randomUUID()}`;
+    await supabaseRequest('/rest/v1/gnakrypay_subscription_payments', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Reference-Id': referenceId,
-        'X-Target-Environment': MTN_MOMO_TARGET_ENVIRONMENT,
-        'Ocp-Apim-Subscription-Key': MTN_MOMO_SUBSCRIPTION_KEY,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
       body: JSON.stringify({
-        amount: String(amount),
-        currency: 'EUR',
-        externalId,
-        payer: {
-          partyIdType: 'MSISDN',
-          partyId,
-        },
-        payerMessage: 'Paiement Ma Boutique',
-        payeeNote: 'Abonnement vendeur Ma Boutique',
+        reference,
+        user_id: req.firebaseUser.uid,
+        amount_gnf: GNAKRYPAY_SUBSCRIPTION_AMOUNT_GNF,
+        operator,
+        status: 'creating',
       }),
     });
 
-    if (!response.ok && response.status !== 202) {
-      const errText = await response.text();
-      throw new Error(`MTN MoMo Error (${response.status}): ${errText}`);
-    }
+    const created = gnakryPaymentPayload(await gnakryPayRequest('/payments', {
+      method: 'POST',
+      idempotencyKey: reference,
+      body: {
+        amount: String(GNAKRYPAY_SUBSCRIPTION_AMOUNT_GNF),
+        currency: 'GNF',
+        operator,
+        phone,
+        reference,
+        description: 'Abonnement vendeur Ma Boutique - 30 jours',
+        ...(req.firebaseUser.email ? { email: req.firebaseUser.email } : {}),
+      },
+    }));
+    const paymentId = String(created.payment_id || created.id || '');
+    if (!paymentId) throw new Error('GnakryPay n’a pas renvoyé l’identifiant du paiement.');
+    providerPaymentCreated = true;
+    const providerStatus = String(created.payment_status || created.status || 'PENDING').toUpperCase();
+    const dbStatus = providerStatus === 'SUCCESS' ? 'pending' :
+      ['FAILED', 'EXPIRED'].includes(providerStatus) ? providerStatus.toLowerCase() : 'pending';
+    await supabaseRequest(
+      `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&status=eq.creating`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify({ payment_id: paymentId, status: dbStatus }),
+      }
+    );
 
-    res.json({
+    if (providerStatus === 'SUCCESS') {
+      const activation = await activateGnakrySubscription({ ...created, reference, payment_id: paymentId, payment_status: 'SUCCESS' });
+      if (!activation.activated) throw new Error('Le paiement est confirmé, mais son activation doit être réessayée.');
+    }
+    res.status(201).json({
       success: true,
-      referenceId,
-      externalId,
-      message: 'Demande de paiement envoyée sur votre téléphone MTN MoMo. Veuillez valider avec votre code PIN.',
+      reference,
+      paymentId,
+      status: providerStatus,
+      isPaid: providerStatus === 'SUCCESS',
+      message: providerStatus === 'SUCCESS'
+        ? 'Paiement confirmé et abonnement activé.'
+        : 'Demande envoyée. Confirme le paiement sur ton téléphone; l’abonnement sera activé après confirmation.',
     });
   } catch (error) {
-    console.error('POST /api/payments/mtn-momo/initiate:', error.message);
-    res.status(error.status || 500).json({ success: false, message: error.message || 'Impossible d’initialiser le paiement MTN MoMo.' });
+    if (reference && !providerPaymentCreated) {
+      try {
+        await supabaseRequest(
+          `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&status=eq.creating`,
+          { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'failed' }) }
+        );
+      } catch (_) {}
+    }
+    console.error('POST GnakryPay subscription initiate:', error.message);
+    res.status(error.status || 502).json({ success: false, message: error.message || 'Impossible de démarrer le paiement GnakryPay.' });
   }
 });
 
-app.get('/api/payments/mtn-momo/status/:referenceId', requireFirebaseUser, async (req, res) => {
+app.get('/api/payments/gnakrypay/subscription/:reference/status', requireFirebaseUser, requireSellerRole, async (req, res) => {
   try {
-    const referenceId = req.params.referenceId;
-    if (!referenceId) {
-      return res.status(400).json({ success: false, message: 'Référence de transaction manquante.' });
+    const reference = req.params.reference;
+    const rows = await supabaseRequest(
+      `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&user_id=eq.${encodeURIComponent(req.firebaseUser.uid)}&select=reference,payment_id,status,amount_gnf`
+    );
+    const record = rows[0];
+    if (!record) return res.status(404).json({ success: false, message: 'Paiement GnakryPay introuvable.' });
+    if (record.status === 'success') return res.json({ success: true, status: 'SUCCESS', isPaid: true, activated: true });
+    if (['failed', 'expired'].includes(record.status)) {
+      return res.json({ success: true, status: record.status.toUpperCase(), isPaid: false, activated: false });
     }
+    if (!record.payment_id) return res.json({ success: true, status: 'PENDING', isPaid: false, activated: false });
 
-    const token = await getMtnMomoToken();
-    const response = await fetch(`${mtnBaseUrl}/collection/v1_0/requesttopay/${referenceId}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Target-Environment': MTN_MOMO_TARGET_ENVIRONMENT,
-        'Ocp-Apim-Subscription-Key': MTN_MOMO_SUBSCRIPTION_KEY,
-      },
-    });
-
-    const data = await response.json().catch(() => null);
-    if (!response.ok || !data) {
-      throw new Error('Impossible de vérifier le statut de la transaction MTN MoMo.');
+    const payment = gnakryPaymentPayload(await gnakryPayRequest(`/payments/${encodeURIComponent(record.payment_id)}`));
+    const status = String(payment.payment_status || payment.status || 'PENDING').toUpperCase();
+    let activated = false;
+    if (status === 'SUCCESS') {
+      const verified = { ...payment, payment_id: payment.payment_id || payment.id || record.payment_id, reference: payment.reference || record.reference };
+      const activation = await activateGnakrySubscription(verified);
+      if (!activation.matched) return res.status(409).json({ success: false, message: 'Les informations du paiement vérifié ne correspondent pas à la commande.' });
+      activated = activation.activated;
+      if (!activated) return res.status(409).json({ success: false, message: 'Paiement confirmé, mais l’activation doit être réessayée.' });
+    } else if (['FAILED', 'EXPIRED'].includes(status)) {
+      await supabaseRequest(
+        `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&status=in.(creating,pending)`,
+        { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: status.toLowerCase() }) }
+      );
     }
-
-    const status = data.status; // SUCCESSFUL, PENDING, FAILED
-    const isSuccess = status === 'SUCCESSFUL';
-
-    res.json({
-      success: true,
-      status,
-      isSuccess,
-      financialTransactionId: data.financialTransactionId || '',
-      reason: data.reason || null,
-    });
+    res.json({ success: true, status, isPaid: status === 'SUCCESS' && activated, activated });
   } catch (error) {
-    console.error('GET /api/payments/mtn-momo/status:', error.message);
-    res.status(error.status || 500).json({ success: false, message: error.message || 'Erreur lors de la vérification du statut MTN MoMo.' });
+    console.error('GET GnakryPay subscription status:', error.message);
+    res.status(error.status || 502).json({ success: false, message: error.message || 'Impossible de vérifier le paiement GnakryPay.' });
+  }
+});
+
+app.post('/api/payments/gnakrypay/webhook', async (req, res) => {
+  if (!GNAKRYPAY_WEBHOOK_SECRET || !req.rawBody) {
+    return res.status(503).json({ success: false, message: 'Vérification du webhook GnakryPay non configurée.' });
+  }
+  const supplied = String(req.headers['x-gnakrypay-signature'] || '');
+  const expected = `sha256=${crypto.createHmac('sha256', GNAKRYPAY_WEBHOOK_SECRET).update(req.rawBody).digest('hex')}`;
+  const suppliedBuffer = Buffer.from(supplied);
+  const expectedBuffer = Buffer.from(expected);
+  if (suppliedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)) {
+    return res.status(401).json({ success: false, message: 'Signature webhook GnakryPay invalide.' });
+  }
+
+  let payload;
+  try { payload = JSON.parse(req.rawBody.toString('utf8')); } catch (_) {
+    return res.status(400).json({ success: false, message: 'Corps webhook JSON invalide.' });
+  }
+  const event = String(req.headers['x-gnakrypay-event'] || '');
+  const status = String(payload.payment_status || '').toUpperCase();
+  try {
+    if (event === 'payment.success' && status === 'SUCCESS') {
+      const activation = await activateGnakrySubscription(payload);
+      if (!activation.matched || !activation.activated) {
+        return res.status(409).json({ success: false, message: 'Paiement non reconnu ou activation à réessayer.' });
+      }
+    } else if (['payment.failed', 'payment.expired'].includes(event)) {
+      const reference = String(payload.reference || '');
+      const paymentId = String(payload.payment_id || '');
+      const finalStatus = event === 'payment.expired' ? 'expired' : 'failed';
+      if (reference && paymentId) {
+        await supabaseRequest(
+          `/rest/v1/gnakrypay_subscription_payments?reference=eq.${encodeURIComponent(reference)}&payment_id=eq.${encodeURIComponent(paymentId)}&status=in.(creating,pending)`,
+          { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: finalStatus }) }
+        );
+      }
+    }
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error('GnakryPay webhook:', error.message);
+    return res.status(500).json({ success: false, message: 'Traitement du webhook GnakryPay à réessayer.' });
   }
 });
 
 app.get('/api/app-version', (_req, res) => {
   res.json({
     success: true,
-    latestVersion: process.env.APP_LATEST_VERSION || '1.1.0',
-    minimumVersion: process.env.APP_MINIMUM_VERSION || '1.0.0',
-    updateUrl: process.env.APP_UPDATE_URL || `${PUBLIC_BASE_URL}/download/ma_boutique.apk`,
-    message: process.env.APP_UPDATE_MESSAGE || '🎉 Nouvelle version 1.1.0 disponible ! Profitez du chat en direct, du suivi de livraison en temps réel et des notes acheteurs.',
+    latestVersion: process.env.APP_LATEST_VERSION || '1.2.4',
+    minimumVersion: process.env.APP_MINIMUM_VERSION || '1.2.2',
+    updateUrl: 'https://drive.google.com/uc?export=download&id=1bYz7iZ4T9OMJD_in5g3cvxLCpmEKF4_f',
+    message: process.env.APP_UPDATE_MESSAGE || '🎉 Nouvelle version 1.2.4 disponible ! Profitez des nouvelles fonctionnalités ajoutées.',
   });
 });
 
